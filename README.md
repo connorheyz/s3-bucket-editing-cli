@@ -27,6 +27,7 @@ A simple Python CLI tool to upload, delete, restore, and view files in an S3 buc
     AWS_REGION=us-east-1
     S3_BUCKET_NAME=your-bucket-name
     LOCAL_BUCKET_PATH=bucket-path
+    CLOUDFRONT_DISTRIBUTION_IDS=ID1,ID2
     ```
 
    Replace with your actual credentials and bucket name. Keep the `.env` file **secret**.
