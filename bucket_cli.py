@@ -3,7 +3,7 @@
 bucket_cli.py
 
 A simple CLI tool to upload, delete, restore, and view files in an S3 bucket,
-with support for a .bucketignore file (to skip uploading certain files).
+using .bucketignore and a local folder set in .env (LOCAL_BUCKET_PATH).
 """
 
 import os
@@ -26,10 +26,10 @@ def parse_arguments():
 
     # 'upload' command
     upload_parser = subparsers.add_parser("upload", help="Upload or update a file in the bucket")
-    upload_parser.add_argument("target", help="File name or '.' for all files in the current directory")
+    upload_parser.add_argument("target", help="File name relative to the local bucket folder or '.' for all files in that folder")
     
     # 'delete' command
-    delete_parser = subparsers.add_parser("delete", help="Delete a file in the bucket")
+    delete_parser = subparsers.add_parser("delete", help="Delete a file in the bucket (does NOT delete locally)")
     delete_parser.add_argument("target", help="File name or '.' for all files in the bucket")
     
     # 'restore' command
@@ -58,6 +58,16 @@ def get_s3_client():
         region_name=region
     )
     return s3
+
+def get_local_bucket_path():
+    """
+    Returns the local folder path from which files should be uploaded and into which files should be restored.
+    Defaults to 'bucket' if LOCAL_BUCKET_PATH is not defined.
+    """
+    local_path = os.getenv("LOCAL_BUCKET_PATH", "bucket")
+    if not os.path.exists(local_path):
+        os.makedirs(local_path)
+    return local_path
 
 def get_ignored_patterns():
     """
@@ -89,42 +99,54 @@ def should_ignore_file(filename, ignore_patterns):
 
 def upload_files(s3_client, bucket_name, target):
     """
-    Uploads a file (or all files in the current directory if target='.')
-    to the specified S3 bucket, skipping those matched in .bucketignore.
+    Uploads a file (or all files) from the local 'bucket' folder to the specified S3 bucket,
+    respecting .bucketignore patterns.
     """
+    local_bucket_path = get_local_bucket_path()
     ignore_patterns = get_ignored_patterns()
 
     if target == ".":
-        # Upload all files in the current directory
-        for file_name in os.listdir("."):
-            if os.path.isfile(file_name):
-                # Skip if file matches any pattern in .bucketignore
-                if should_ignore_file(file_name, ignore_patterns):
-                    print(f"Skipping {file_name} (ignored by .bucketignore)")
+        # Upload all files (recursively) from the local_bucket_path
+        for root, dirs, files in os.walk(local_bucket_path):
+            for file_name in files:
+                local_path = os.path.join(root, file_name)
+                # Derive the S3 key as the relative path from local_bucket_path
+                s3_key = os.path.relpath(local_path, local_bucket_path)
+
+                # Check against .bucketignore
+                # We'll check only the filename and/or partial path
+                # For best results, we can check the entire s3_key
+                if should_ignore_file(s3_key, ignore_patterns):
+                    print(f"Skipping {s3_key} (ignored by .bucketignore)")
                     continue
-                # Proceed with upload
+
                 try:
-                    print(f"Uploading {file_name}...")
-                    s3_client.upload_file(file_name, bucket_name, file_name)
+                    print(f"Uploading {s3_key}...")
+                    s3_client.upload_file(local_path, bucket_name, s3_key)
                 except ClientError as e:
-                    print(f"Error uploading {file_name}: {e}")
+                    print(f"Error uploading {s3_key}: {e}")
     else:
-        # Upload single file
-        if not os.path.isfile(target):
-            print(f"File '{target}' not found on local machine.")
+        # Upload a single file from the local bucket folder
+        local_path = os.path.join(local_bucket_path, target)
+        if not os.path.isfile(local_path):
+            print(f"File '{local_path}' not found in local bucket folder.")
             return
+
+        # Check against .bucketignore
         if should_ignore_file(target, ignore_patterns):
             print(f"Skipping {target} (ignored by .bucketignore)")
             return
+
         try:
             print(f"Uploading {target}...")
-            s3_client.upload_file(target, bucket_name, target)
+            s3_client.upload_file(local_path, bucket_name, target)
         except ClientError as e:
             print(f"Error uploading {target}: {e}")
 
 def delete_files(s3_client, bucket_name, target):
     """
     Deletes a file (or all files if target='.') from the specified S3 bucket.
+    This does NOT remove files locally.
     """
     if target == ".":
         # Delete all files in the bucket
@@ -133,7 +155,7 @@ def delete_files(s3_client, bucket_name, target):
             if "Contents" in objects_to_delete:
                 for obj in objects_to_delete["Contents"]:
                     key = obj["Key"]
-                    print(f"Deleting {key}...")
+                    print(f"Deleting {key} in bucket...")
                     s3_client.delete_object(Bucket=bucket_name, Key=key)
             else:
                 print("Bucket is already empty.")
@@ -142,33 +164,50 @@ def delete_files(s3_client, bucket_name, target):
     else:
         # Delete a single file
         try:
-            print(f"Deleting {target}...")
+            print(f"Deleting {target} in bucket...")
             s3_client.delete_object(Bucket=bucket_name, Key=target)
         except ClientError as e:
             print(f"Error deleting {target}: {e}")
 
 def restore_files(s3_client, bucket_name, target):
     """
-    Downloads a file (or all files in the bucket if target='.') to the local machine.
+    Downloads a file (or all files) from the bucket into the local 'bucket' folder,
+    creating subdirectories as necessary.
     """
+    local_bucket_path = get_local_bucket_path()
+
     if target == ".":
         # Download all files from the bucket
         try:
             objects_to_download = s3_client.list_objects_v2(Bucket=bucket_name)
             if "Contents" in objects_to_download:
                 for obj in objects_to_download["Contents"]:
-                    key = obj["Key"]
-                    print(f"Downloading {key}...")
-                    s3_client.download_file(bucket_name, key, key)
+                    key = obj["Key"]  # e.g., 'images/alexandria-logo.svg'
+                    # Local path = local_bucket_path + relative subfolders
+                    local_path = os.path.join(local_bucket_path, key)
+
+                    # Ensure local subdirectories exist
+                    local_dir = os.path.dirname(local_path)
+                    if local_dir and not os.path.exists(local_dir):
+                        os.makedirs(local_dir)
+
+                    print(f"Downloading {key} to {local_path}...")
+                    s3_client.download_file(bucket_name, key, local_path)
             else:
                 print("Bucket is empty. Nothing to download.")
         except ClientError as e:
             print(f"Error listing/downloading files: {e}")
     else:
         # Download a single file
+        key = target
+        local_path = os.path.join(local_bucket_path, key)
+        local_dir = os.path.dirname(local_path)
+        if local_dir and not os.path.exists(local_dir):
+            os.makedirs(local_dir)
+
         try:
-            print(f"Downloading {target}...")
-            s3_client.download_file(bucket_name, target, target)
+            print(f"Downloading {key} to {local_path}...")
+            s3_client.download_file(bucket_name, key, local_path)
         except ClientError as e:
             print(f"Error downloading {target}: {e}")
 
