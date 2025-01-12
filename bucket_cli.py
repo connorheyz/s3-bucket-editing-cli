@@ -3,7 +3,7 @@
 bucket_cli.py
 
 A simple CLI tool to upload, delete, restore, and view files in an S3 bucket,
-with .bucketignore support, an invalidate command for CloudFront,
+with .bucketignore support, multiple CloudFront invalidate commands,
 and automatic Content-Type detection via mimetypes.
 """
 
@@ -43,7 +43,7 @@ def parse_arguments():
     subparsers.add_parser("view", help="View contents of the bucket")
 
     # 'invalidate' command (CloudFront)
-    invalidate_parser = subparsers.add_parser("invalidate", help="Invalidate files in the CloudFront distribution")
+    invalidate_parser = subparsers.add_parser("invalidate", help="Invalidate files in the CloudFront distributions")
     invalidate_parser.add_argument(
         "target",
         help="Path or '.' for all files, e.g. /images/*, /index.html, or . for everything"
@@ -69,9 +69,19 @@ def get_s3_client():
     )
     return s3
 
+def get_distribution_ids():
+    """
+    Returns a list of CloudFront distribution IDs from the .env variable
+    'CLOUDFRONT_DISTRIBUTION_IDS', which may contain a comma-separated list.
+    """
+    dist_var = os.getenv("CLOUDFRONT_DISTRIBUTION_IDS", "")
+    # Split by comma, strip spaces
+    distribution_ids = [d.strip() for d in dist_var.split(",") if d.strip()]
+    return distribution_ids
+
 def invalidate_cloudfront(distribution_id, paths):
     """
-    Creates a CloudFront invalidation for the given distribution_id and list of paths.
+    Creates a CloudFront invalidation for a single distribution_id and list of paths.
     'paths' should be a list of strings (e.g., ['/index.html', '/images/*']).
     """
     if not distribution_id:
@@ -83,7 +93,7 @@ def invalidate_cloudfront(distribution_id, paths):
     caller_reference = str(time.time())  # unique string for each invalidation
 
     try:
-        print(f"Creating CloudFront invalidation for paths: {paths}")
+        print(f"Creating CloudFront invalidation for Distribution '{distribution_id}' with paths: {paths}")
         response = cf_client.create_invalidation(
             DistributionId=distribution_id,
             InvalidationBatch={
@@ -95,9 +105,9 @@ def invalidate_cloudfront(distribution_id, paths):
             }
         )
         inv_id = response["Invalidation"]["Id"]
-        print(f"CloudFront Invalidation created: {inv_id}")
+        print(f"CloudFront Invalidation created ({distribution_id}): {inv_id}")
     except ClientError as e:
-        print(f"Error creating CloudFront invalidation: {e}")
+        print(f"Error creating CloudFront invalidation for {distribution_id}: {e}")
 
 def get_local_bucket_path():
     """
@@ -147,17 +157,13 @@ def guess_content_type(file_path):
 
 def to_s3_key(local_path, local_bucket_path):
     """
-    Derive the S3 key as the relative path from local_bucket_path,
-    then replace backslashes with forward slashes to ensure
-    proper directory structure in S3.
+    Convert a local path to an S3 key with forward slashes, preserving relative path structure.
+    e.g., 'images\\logo.png' -> 'images/logo.png'
     """
-    # e.g., relative path might be "images\logo.png" on Windows
     rel_path = os.path.relpath(local_path, local_bucket_path)
-
-    # Convert backslashes to forward slashes
+    # Convert backslashes on Windows to forward slashes
     s3_key = rel_path.replace("\\", "/")
     return s3_key
-
 
 def upload_single_file(s3_client, local_path, bucket_name, s3_key):
     """
@@ -188,7 +194,6 @@ def upload_files(s3_client, bucket_name, target):
         for root, dirs, files in os.walk(local_bucket_path):
             for file_name in files:
                 local_path = os.path.join(root, file_name)
-                # Derive the S3 key as the relative path from local_bucket_path
                 s3_key = to_s3_key(local_path, local_bucket_path)
 
                 if should_ignore_file(s3_key, ignore_patterns):
@@ -199,15 +204,15 @@ def upload_files(s3_client, bucket_name, target):
     else:
         # Upload a single file from the local bucket folder
         local_path = os.path.join(local_bucket_path, target)
+        s3_key = to_s3_key(local_path, local_bucket_path)
+
         if not os.path.isfile(local_path):
             print(f"File '{local_path}' not found in local bucket folder.")
             return
 
-        if should_ignore_file(target, ignore_patterns):
-            print(f"Skipping {target} (ignored by .bucketignore)")
+        if should_ignore_file(s3_key, ignore_patterns):
+            print(f"Skipping {s3_key} (ignored by .bucketignore)")
             return
-        
-        s3_key = to_s3_key(local_path, local_bucket_path)
 
         upload_single_file(s3_client, local_path, bucket_name, s3_key)
 
@@ -251,7 +256,7 @@ def restore_files(s3_client, bucket_name, target):
             if "Contents" in objects_to_download:
                 for obj in objects_to_download["Contents"]:
                     key = obj["Key"]
-                    local_path = os.path.join(local_bucket_path, key)
+                    local_path = os.path.join(local_bucket_path, key.replace("/", os.sep))
                     local_dir = os.path.dirname(local_path)
                     if local_dir and not os.path.exists(local_dir):
                         os.makedirs(local_dir)
@@ -264,7 +269,7 @@ def restore_files(s3_client, bucket_name, target):
             print(f"Error listing/downloading files: {e}")
     else:
         key = target
-        local_path = os.path.join(local_bucket_path, key)
+        local_path = os.path.join(local_bucket_path, key.replace("/", os.sep))
         local_dir = os.path.dirname(local_path)
         if local_dir and not os.path.exists(local_dir):
             os.makedirs(local_dir)
@@ -323,17 +328,26 @@ def main():
         view_bucket(s3_client, bucket_name)
 
     elif command == "invalidate":
-        # Invalidate command doesn't need S3 bucket name
-        distribution_id = os.getenv("CLOUDFRONT_DISTRIBUTION_ID")
+        # Retrieve the distribution IDs (list)
+        distribution_ids = get_distribution_ids()
+        if not distribution_ids:
+            print("No CloudFront distribution IDs found. Set CLOUDFRONT_DISTRIBUTION_IDS in .env.")
+            sys.exit(1)
+
         target = args.target
+        # Determine path(s) to invalidate
         if target == ".":
             # Invalidate everything
-            invalidate_cloudfront(distribution_id, ["/*"])
+            paths = ["/*"]
         else:
             # Ensure path starts with "/"
             if not target.startswith("/"):
                 target = "/" + target
-            invalidate_cloudfront(distribution_id, [target])
+            paths = [target]
+
+        # Invalidate each distribution ID
+        for dist_id in distribution_ids:
+            invalidate_cloudfront(dist_id, paths)
 
     else:
         print("No valid command was provided. Use '--help' for usage information.")

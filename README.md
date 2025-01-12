@@ -19,7 +19,7 @@ A simple Python CLI tool to upload, delete, restore, and view files in an S3 buc
 ## 3. Local Environment Setup
 
 1. **Clone** or **download** this repository.
-2. **Create** a `.env` file (use `.env-example` and rename it) in the project root with the following format:
+2. **Create** a `.env` file (or use `.env-example` and rename it) in the project root with the following format:
 
     ```text
     AWS_ACCESS_KEY_ID=YOUR_ACCESS_KEY_ID
