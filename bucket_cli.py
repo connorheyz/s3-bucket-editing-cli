@@ -145,6 +145,20 @@ def guess_content_type(file_path):
     content_type, _ = mimetypes.guess_type(file_path)
     return content_type or "application/octet-stream"
 
+def to_s3_key(local_path, local_bucket_path):
+    """
+    Derive the S3 key as the relative path from local_bucket_path,
+    then replace backslashes with forward slashes to ensure
+    proper directory structure in S3.
+    """
+    # e.g., relative path might be "images\logo.png" on Windows
+    rel_path = os.path.relpath(local_path, local_bucket_path)
+
+    # Convert backslashes to forward slashes
+    s3_key = rel_path.replace("\\", "/")
+    return s3_key
+
+
 def upload_single_file(s3_client, local_path, bucket_name, s3_key):
     """
     Upload a single file with Content-Type guessed via mimetypes.
@@ -175,7 +189,7 @@ def upload_files(s3_client, bucket_name, target):
             for file_name in files:
                 local_path = os.path.join(root, file_name)
                 # Derive the S3 key as the relative path from local_bucket_path
-                s3_key = os.path.relpath(local_path, local_bucket_path)
+                s3_key = to_s3_key(local_path, local_bucket_path)
 
                 if should_ignore_file(s3_key, ignore_patterns):
                     print(f"Skipping {s3_key} (ignored by .bucketignore)")
@@ -192,8 +206,10 @@ def upload_files(s3_client, bucket_name, target):
         if should_ignore_file(target, ignore_patterns):
             print(f"Skipping {target} (ignored by .bucketignore)")
             return
+        
+        s3_key = to_s3_key(local_path, local_bucket_path)
 
-        upload_single_file(s3_client, local_path, bucket_name, target)
+        upload_single_file(s3_client, local_path, bucket_name, s3_key)
 
 def delete_files(s3_client, bucket_name, target):
     """
