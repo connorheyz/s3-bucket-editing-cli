@@ -3,12 +3,15 @@
 bucket_cli.py
 
 A simple CLI tool to upload, delete, restore, and view files in an S3 bucket,
-using .bucketignore and a local folder set in .env (LOCAL_BUCKET_PATH).
+with .bucketignore support, an invalidate command for CloudFront,
+and automatic Content-Type detection via mimetypes.
 """
 
 import os
 import sys
 import argparse
+import time
+import mimetypes
 from dotenv import load_dotenv
 import boto3
 from botocore.exceptions import ClientError
@@ -39,6 +42,13 @@ def parse_arguments():
     # 'view' command
     subparsers.add_parser("view", help="View contents of the bucket")
 
+    # 'invalidate' command (CloudFront)
+    invalidate_parser = subparsers.add_parser("invalidate", help="Invalidate files in the CloudFront distribution")
+    invalidate_parser.add_argument(
+        "target",
+        help="Path or '.' for all files, e.g. /images/*, /index.html, or . for everything"
+    )
+
     return parser.parse_args()
 
 def get_s3_client():
@@ -58,6 +68,36 @@ def get_s3_client():
         region_name=region
     )
     return s3
+
+def invalidate_cloudfront(distribution_id, paths):
+    """
+    Creates a CloudFront invalidation for the given distribution_id and list of paths.
+    'paths' should be a list of strings (e.g., ['/index.html', '/images/*']).
+    """
+    if not distribution_id:
+        print("No CloudFront Distribution ID provided, skipping invalidation.")
+        return
+
+    cf_client = boto3.client("cloudfront")
+
+    caller_reference = str(time.time())  # unique string for each invalidation
+
+    try:
+        print(f"Creating CloudFront invalidation for paths: {paths}")
+        response = cf_client.create_invalidation(
+            DistributionId=distribution_id,
+            InvalidationBatch={
+                "Paths": {
+                    "Quantity": len(paths),
+                    "Items": paths
+                },
+                "CallerReference": caller_reference
+            }
+        )
+        inv_id = response["Invalidation"]["Id"]
+        print(f"CloudFront Invalidation created: {inv_id}")
+    except ClientError as e:
+        print(f"Error creating CloudFront invalidation: {e}")
 
 def get_local_bucket_path():
     """
@@ -97,10 +137,34 @@ def should_ignore_file(filename, ignore_patterns):
             return True
     return False
 
+def guess_content_type(file_path):
+    """
+    Uses the 'mimetypes' library to guess the content type of a file.
+    Returns 'application/octet-stream' if it cannot determine the type.
+    """
+    content_type, _ = mimetypes.guess_type(file_path)
+    return content_type or "application/octet-stream"
+
+def upload_single_file(s3_client, local_path, bucket_name, s3_key):
+    """
+    Upload a single file with Content-Type guessed via mimetypes.
+    """
+    content_type = guess_content_type(local_path)
+    try:
+        s3_client.upload_file(
+            Filename=local_path,
+            Bucket=bucket_name,
+            Key=s3_key,
+            ExtraArgs={"ContentType": content_type}
+        )
+        print(f"Uploaded {s3_key} (Content-Type: {content_type})")
+    except ClientError as e:
+        print(f"Error uploading {s3_key}: {e}")
+
 def upload_files(s3_client, bucket_name, target):
     """
     Uploads a file (or all files) from the local 'bucket' folder to the specified S3 bucket,
-    respecting .bucketignore patterns.
+    respecting .bucketignore patterns and using guessed Content-Type.
     """
     local_bucket_path = get_local_bucket_path()
     ignore_patterns = get_ignored_patterns()
@@ -113,18 +177,11 @@ def upload_files(s3_client, bucket_name, target):
                 # Derive the S3 key as the relative path from local_bucket_path
                 s3_key = os.path.relpath(local_path, local_bucket_path)
 
-                # Check against .bucketignore
-                # We'll check only the filename and/or partial path
-                # For best results, we can check the entire s3_key
                 if should_ignore_file(s3_key, ignore_patterns):
                     print(f"Skipping {s3_key} (ignored by .bucketignore)")
                     continue
 
-                try:
-                    print(f"Uploading {s3_key}...")
-                    s3_client.upload_file(local_path, bucket_name, s3_key)
-                except ClientError as e:
-                    print(f"Error uploading {s3_key}: {e}")
+                upload_single_file(s3_client, local_path, bucket_name, s3_key)
     else:
         # Upload a single file from the local bucket folder
         local_path = os.path.join(local_bucket_path, target)
@@ -132,16 +189,11 @@ def upload_files(s3_client, bucket_name, target):
             print(f"File '{local_path}' not found in local bucket folder.")
             return
 
-        # Check against .bucketignore
         if should_ignore_file(target, ignore_patterns):
             print(f"Skipping {target} (ignored by .bucketignore)")
             return
 
-        try:
-            print(f"Uploading {target}...")
-            s3_client.upload_file(local_path, bucket_name, target)
-        except ClientError as e:
-            print(f"Error uploading {target}: {e}")
+        upload_single_file(s3_client, local_path, bucket_name, target)
 
 def delete_files(s3_client, bucket_name, target):
     """
@@ -182,11 +234,8 @@ def restore_files(s3_client, bucket_name, target):
             objects_to_download = s3_client.list_objects_v2(Bucket=bucket_name)
             if "Contents" in objects_to_download:
                 for obj in objects_to_download["Contents"]:
-                    key = obj["Key"]  # e.g., 'images/alexandria-logo.svg'
-                    # Local path = local_bucket_path + relative subfolders
+                    key = obj["Key"]
                     local_path = os.path.join(local_bucket_path, key)
-
-                    # Ensure local subdirectories exist
                     local_dir = os.path.dirname(local_path)
                     if local_dir and not os.path.exists(local_dir):
                         os.makedirs(local_dir)
@@ -198,7 +247,6 @@ def restore_files(s3_client, bucket_name, target):
         except ClientError as e:
             print(f"Error listing/downloading files: {e}")
     else:
-        # Download a single file
         key = target
         local_path = os.path.join(local_bucket_path, key)
         local_dir = os.path.dirname(local_path)
@@ -232,20 +280,45 @@ def main():
     
     # Retrieve your bucket name from the .env
     bucket_name = os.getenv("S3_BUCKET_NAME")
-    if not bucket_name:
-        print("Error: Please set S3_BUCKET_NAME in your .env file.")
-        sys.exit(1)
-
     command = args.command
 
     if command == "upload":
+        if not bucket_name:
+            print("Error: Please set S3_BUCKET_NAME in your .env file.")
+            sys.exit(1)
         upload_files(s3_client, bucket_name, args.target)
+
     elif command == "delete":
+        if not bucket_name:
+            print("Error: Please set S3_BUCKET_NAME in your .env file.")
+            sys.exit(1)
         delete_files(s3_client, bucket_name, args.target)
+
     elif command == "restore":
+        if not bucket_name:
+            print("Error: Please set S3_BUCKET_NAME in your .env file.")
+            sys.exit(1)
         restore_files(s3_client, bucket_name, args.target)
+
     elif command == "view":
+        if not bucket_name:
+            print("Error: Please set S3_BUCKET_NAME in your .env file.")
+            sys.exit(1)
         view_bucket(s3_client, bucket_name)
+
+    elif command == "invalidate":
+        # Invalidate command doesn't need S3 bucket name
+        distribution_id = os.getenv("CLOUDFRONT_DISTRIBUTION_ID")
+        target = args.target
+        if target == ".":
+            # Invalidate everything
+            invalidate_cloudfront(distribution_id, ["/*"])
+        else:
+            # Ensure path starts with "/"
+            if not target.startswith("/"):
+                target = "/" + target
+            invalidate_cloudfront(distribution_id, [target])
+
     else:
         print("No valid command was provided. Use '--help' for usage information.")
 
