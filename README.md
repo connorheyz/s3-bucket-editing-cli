@@ -16,7 +16,7 @@ A simple Python CLI tool to upload, delete, restore, and view files in an S3 buc
 - Create (or use) a user with the **`AmazonS3FullAccess`** policy (or a custom policy that at least allows reading/writing to the S3 bucket in question).
 - Generate **Access Key ID** and **Secret Access Key** for this user.
 
-## 4. Local Environment Setup
+## 3. Local Environment Setup
 
 1. **Clone** or **download** this repository.
 2. **Create** a `.env` file (use `.env-example` and rename it) in the project root with the following format:
@@ -37,7 +37,7 @@ A simple Python CLI tool to upload, delete, restore, and view files in an S3 buc
     pip install -r requirements.txt
     ```
 
-## 5. Usage
+## 4. Usage
 
 From the command line in the same directory as `bucket_cli.py`, you can run:
 
@@ -60,3 +60,5 @@ From the command line in the same directory as `bucket_cli.py`, you can run:
   ```bash
   python bucket_cli.py restore .
   ```
+
+> Note: All bucket files will be in the LOCAL_BUCKET_PATH folder
